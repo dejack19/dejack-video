@@ -7,35 +7,63 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>Evento video</title>
 <style>
-  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
-  #player, #player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
-  /* Strato trasparente sopra il player: nessun click arriva a YouTube (niente pausa/controlli). */
-  #shield { position: absolute; inset: 0; z-index: 2; background: transparent; cursor: none; }
-  #wait { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center;
-          color: #d8c18a; font: 600 28px Georgia, "Times New Roman", serif; letter-spacing: .04em; background: #000; }
-  #wait.hidden { display: none; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  /* Il player è sempre 1920x1080 "interni" e viene scalato allo schermo: YouTube sceglie la
+     qualità in base alla dimensione del player, così prende il 1080p anche su schermi piccoli. */
+  #stage { position: absolute; inset: 0; background: #000; opacity: 0; }
+  #stage.on { opacity: 1; }
+  #frame { position: absolute; left: 50%; top: 50%; width: 1920px; height: 1080px; transform-origin: 0 0; }
+  #frame iframe, #player { width: 1920px; height: 1080px; border: 0; display: block; }
+  /* Strato trasparente sopra tutto: nessun click arriva a YouTube (niente pausa/controlli). */
+  #shield { position: absolute; inset: 0; z-index: 5; background: transparent; cursor: none; }
+
+  /* --- Intro --------------------------------------------------------------- */
+  #black { position: absolute; inset: 0; z-index: 3; background: #000; display: none; }
+  #noise { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; display: none;
+           image-rendering: pixelated; opacity: 0; }
+  /* Spegnimento TV a tubo catodico: statico bianco con bordi scuri -> si schiaccia in una riga
+     luminosa con alone -> la riga si accorcia fino a un punto che si spegne. */
+  #tv { position: absolute; inset: 0; z-index: 4; display: none; background: #000; overflow: hidden; }
+  #crt { position: absolute; inset: 0; transform-origin: 50% 50%; overflow: hidden; border-radius: 3%; }
+  #crt canvas { width: 100%; height: 100%; display: block; image-rendering: auto; }
+  #crt .vig { position: absolute; inset: 0;
+              background: radial-gradient(ellipse 62% 58% at 50% 50%, rgba(255,255,255,.55) 0%, rgba(255,255,255,0) 45%, rgba(0,0,0,.55) 75%, rgba(0,0,0,.95) 100%); }
+  #crt .white { position: absolute; inset: 0; background: #fff; opacity: 0; }
+  #glow { position: absolute; left: 50%; top: 50%; width: 60vmin; height: 60vmin; margin: -30vmin 0 0 -30vmin;
+          border-radius: 50%; opacity: 0; pointer-events: none;
+          background: radial-gradient(circle, rgba(255,255,255,.95) 0%, rgba(235,240,255,.45) 12%, rgba(200,210,255,.12) 35%, rgba(0,0,0,0) 70%); }
 </style>
 </head>
 <body>
-<div id="player"></div>
+<div id="stage"><div id="frame"><div id="player"></div></div></div>
+<canvas id="noise" width="160" height="90"></canvas>
+<div id="black"></div>
+<div id="tv"><div id="crt"><canvas id="static" width="192" height="108"></canvas><div class="vig"></div><div class="white"></div></div><div id="glow"></div></div>
 <div id="shield"></div>
-<div id="wait">L'evento sta per iniziare…</div>
 <script>
-// Pagina del player di dejack-video. Va pubblicata su un indirizzo https (es. GitHub Pages):
-// da fw:// YouTube risponde "Error 153". Parametri nell'hash: #v=<videoId>&s=<inizio, ms orologio locale>.
-// La pagina condivide l'orologio del PC con lo script client, quindi si tiene in sync da sola;
-// se il ponte callEvent/Web.emit è disponibile lo usa per durata, fine e ricalibrazioni.
+// Pagina del player di dejack-video. Pubblicata su https (GitHub Pages): da fw:// YouTube dà "Error 153".
+// Parametri nell'hash: #v=<videoId>&s=<inizio video, ms orologio locale>.
+// La pagina condivide l'orologio del PC con lo script client, quindi intro e video sono
+// sincronizzati da soli; il ponte callEvent/Web.emit (se c'è) serve per durata, fine, ricalibrazioni.
 (function () {
   "use strict";
+  // Intro, in ms prima dell'inizio del video: confusione -> spegnimento TV -> nero -> video.
+  var CONFUSION = 2600, TV_OFF = 1600, BLACK = 2000;
+  var INTRO = CONFUSION + TV_OFF + BLACK;
+
   var DRIFT_MAX = 0.6;       // secondi di scarto tollerati prima di riallineare
   var SEEK_LEAD = 0.4;       // un seek costa ~0,4-0,5 s di buffering: salta un filo avanti
   var CHECK_EVERY = 60000;   // controllo sync ogni minuto
   var API_TIMEOUT = 15000;
+  var QUALITY = "hd1080";
 
   var player = null, apiReady = false, playerReady = false;
   var videoId = null, startedAtLocal = null;
   var startTimer = null, ended = false, durationSent = false, failed = false, mutedFallbackTried = false;
-  var waitEl = document.getElementById("wait");
+  var $ = function (id) { return document.getElementById(id); };
+  var stage = $("stage"), frame = $("frame"), noise = $("noise"), black = $("black"), tv = $("tv");
+  var crt = $("crt"), crtWhite = crt.querySelector(".white"), glow = $("glow"), stat = $("static");
+  var sctx = stat.getContext("2d"), simg = sctx.createImageData(stat.width, stat.height);
 
   function send(name, payload) {
     try { if (typeof callEvent === "function") callEvent(name, payload == null ? null : JSON.stringify(payload)); } catch (_) {}
@@ -50,6 +78,147 @@
   function duration() { try { return Number(player.getDuration()) || 0; } catch (_) { return 0; } }
   function state() { try { return player.getPlayerState(); } catch (_) { return -1; } }
 
+  // --- Scala 1920x1080 -> schermo (letterbox) -------------------------------------
+  function fit() {
+    var s = Math.min(innerWidth / 1920, innerHeight / 1080);
+    frame.style.transform = "scale(" + s + ") translate(-50%, -50%)";
+  }
+  addEventListener("resize", fit);
+  fit();
+
+  // --- Sottotitoli: spenti sempre (YouTube carica da solo quelli automatici) ------
+  function killCaptions() {
+    try { player.setOption("captions", "track", {}); } catch (_) {}
+    try { player.unloadModule("captions"); } catch (_) {}
+    try { player.unloadModule("cc"); } catch (_) {}
+  }
+
+  // --- Intro -----------------------------------------------------------------------
+  var ctx = noise.getContext("2d");
+  var img = ctx.createImageData(noise.width, noise.height);
+  var introPhase = "";
+  var audio = null;
+
+  function drawNoise(strength) {
+    var d = img.data, w = noise.width, h = noise.height;
+    // righe spostate e colori sfasati: disturbo "magico", leggero per la CPU (160x90 scalato)
+    var tear = Math.random() < 0.35 ? (Math.random() * h) | 0 : -1, tearH = 3 + (Math.random() * 10) | 0;
+    for (var y = 0; y < h; y++) {
+      var band = tear >= 0 && y >= tear && y < tear + tearH;
+      var tint = band ? (Math.random() < 0.5 ? [255, 40, 200] : [40, 230, 255]) : null;
+      for (var x = 0; x < w; x++) {
+        var i = (y * w + x) * 4, v = (Math.random() * 255) | 0;
+        if (tint) { d[i] = tint[0]; d[i + 1] = tint[1]; d[i + 2] = tint[2]; d[i + 3] = 200; }
+        else { d[i] = v; d[i + 1] = v * 0.9; d[i + 2] = v; d[i + 3] = (Math.random() < strength ? 255 : 0) * (0.35 + strength * 0.65); }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  // Suono dell'intro (fruscio crescente + "click" di spegnimento). Se il browser lo blocca, pazienza.
+  function startAudio() {
+    if (audio) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      var ac = new AC();
+      var len = ac.sampleRate * 2, buf = ac.createBuffer(1, len, ac.sampleRate), ch = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+      var src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+      var bp = ac.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 1800; bp.Q.value = 0.6;
+      var g = ac.createGain(); g.gain.value = 0;
+      src.connect(bp); bp.connect(g); g.connect(ac.destination); src.start();
+      audio = { ac: ac, gain: g, filter: bp, src: src };
+    } catch (_) { audio = { ac: null }; }
+  }
+  function audioLevel(v, f) {
+    if (!audio || !audio.ac) return;
+    try { audio.gain.gain.setTargetAtTime(v, audio.ac.currentTime, 0.05); if (f) audio.filter.frequency.setTargetAtTime(f, audio.ac.currentTime, 0.1); } catch (_) {}
+  }
+  function tvClick() {
+    if (!audio || !audio.ac) return;
+    try {
+      var ac = audio.ac, o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(1400, ac.currentTime); o.frequency.exponentialRampToValueAtTime(60, ac.currentTime + 0.35);
+      g.gain.setValueAtTime(0.25, ac.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.4);
+      o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.45);
+    } catch (_) {}
+  }
+  function stopAudio() {
+    if (!audio || !audio.ac) return;
+    try { audio.src.stop(); audio.ac.close(); } catch (_) {}
+    audio = { ac: null };
+  }
+
+  // Statico "neve" chiaro e granuloso del tubo catodico.
+  function drawStatic() {
+    var d = simg.data;
+    for (var i = 0; i < d.length; i += 4) {
+      var v = 120 + ((Math.random() * 135) | 0);
+      d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255;
+    }
+    sctx.putImageData(simg, 0, 0);
+  }
+  var clicked = false;
+  // p = 0..1 dentro lo spegnimento. Tempi presi dal video di riferimento.
+  function drawTv(p) {
+    var minSy = Math.max(3 / Math.max(1, innerHeight), 0.002);
+    var sx = 1, sy = 1, white = 0, g = 0, gs = 1;
+    if (p < 0.5) {                                   // 1) statico bianco con bordi scuri
+      drawStatic();
+    } else if (p < 0.6) {                            // 2) si schiaccia in verticale e si sbianca
+      var k = (p - 0.5) / 0.1; k = k * k;
+      drawStatic();
+      sy = 1 - (1 - minSy) * k; white = Math.min(1, k * 1.4); g = k * 0.8;
+      if (!clicked) { clicked = true; audioLevel(0); tvClick(); }
+    } else if (p < 0.88) {                           // 3) riga luminosa che si accorcia verso il centro
+      var k2 = (p - 0.6) / 0.28;
+      sy = minSy; white = 1; sx = Math.max(0.004, 1 - Math.pow(k2, 1.6)); g = 1; gs = 0.6 + 0.4 * (1 - k2);
+    } else {                                         // 4) il punto si spegne
+      var k3 = (p - 0.88) / 0.12;
+      sy = minSy; white = 1; sx = 0.004 * (1 - k3); g = 1 - k3; gs = 0.6 * (1 - k3 * 0.7);
+    }
+    crt.style.transform = "scale(" + sx + "," + sy + ")";
+    crt.style.boxShadow = white >= 1 ? "0 0 12px 4px rgba(255,255,255,.9), 0 0 40px 10px rgba(190,205,255,.45)" : "none";
+    crtWhite.style.opacity = String(white);
+    glow.style.opacity = String(g);
+    glow.style.transform = "scale(" + gs + ")";
+    crt.style.opacity = p >= 0.995 ? "0" : "1";
+  }
+
+  function setPhase(p) {
+    if (p === introPhase) return;
+    introPhase = p;
+    noise.style.display = p === "confusion" ? "block" : "none";
+    black.style.display = (p === "tvoff" || p === "black") ? "block" : "none";
+    tv.style.display = p === "tvoff" ? "block" : "none";
+    if (p === "tvoff") audioLevel(0.12, 4200);       // fruscio "neve" della TV
+    if (p === "black") audioLevel(0);
+    if (p === "video") { stopAudio(); stage.classList.add("on"); }
+  }
+
+  // Un solo ciclo leggero guidato dall'orologio comune: tutti vedono la stessa fase nello stesso istante.
+  function tick() {
+    if (startedAtLocal == null || ended) return;
+    var ms = Date.now() - startedAtLocal;            // < 0 = prima del video
+    if (ms >= 0) { setPhase("video"); return; }       // video: niente più da animare
+    var intro = ms + INTRO;                           // 0..INTRO dentro l'intro
+    if (intro < 0) { setPhase("wait"); }
+    else if (intro < CONFUSION) {
+      setPhase("confusion");
+      startAudio();
+      var k = intro / CONFUSION;                      // cresce il caos
+      var flicker = Math.random() < 0.08 * k ? 0.15 : 1;
+      noise.style.opacity = String(Math.min(0.92, 0.1 + k * 0.85) * flicker);
+      noise.style.transform = "translate(" + ((Math.random() - 0.5) * 30 * k) + "px," + ((Math.random() - 0.5) * 14 * k) + "px) skewX(" + ((Math.random() - 0.5) * 6 * k) + "deg)";
+      drawNoise(0.25 + k * 0.75);
+      audioLevel(0.05 + k * 0.3, 900 + k * 2600);
+    }
+    else if (intro < CONFUSION + TV_OFF) { setPhase("tvoff"); drawTv((intro - CONFUSION) / TV_OFF); }
+    else setPhase("black");
+    setTimeout(tick, introPhase === "confusion" ? 60 : 50);
+  }
+
+  // --- Player ---------------------------------------------------------------------
   function reportDuration() {
     var d = duration();
     if (!durationSent && d > 0) { durationSent = true; send("dv:duration", { seconds: d }); }
@@ -65,30 +234,31 @@
   function align() {
     if (!playerReady || ended || startedAtLocal == null) return;
     var t = target();
-    if (t < 0) {                                   // non è ancora l'ora: aspetta il via comune
+    if (t < 0) {                                       // prima del via: tieni il video pronto all'inizio
       clearTimeout(startTimer);
       startTimer = setTimeout(align, Math.min(-t * 1000, 60000));
       return;
     }
     var d = duration();
-    if (d > 0 && t >= d - 0.5) return finish();     // entrato dopo la fine
+    if (d > 0 && t >= d - 0.5) return finish();       // entrato dopo la fine
     var cur = 0;
     try { cur = Number(player.getCurrentTime()) || 0; } catch (_) {}
     var s = state();
-    if (Math.abs(cur - t) > DRIFT_MAX) { try { player.seekTo(t + SEEK_LEAD, true); } catch (_) {} }
-    if (s !==YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) { try { player.playVideo(); } catch (_) {} }
-    waitEl.classList.add("hidden");
+    if (Math.abs(cur - t) > DRIFT_MAX) { try { player.seekTo(t > 1 ? t + SEEK_LEAD : t, true); } catch (_) {} }
+    if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) { try { player.playVideo(); } catch (_) {} }
   }
 
   function onStateChange(e) {
     if (e.data === YT.PlayerState.PLAYING) {
+      killCaptions();
+      try { player.setPlaybackQuality(QUALITY); } catch (_) {}
+      if (target() < 0) { try { player.pauseVideo(); player.seekTo(0, true); player.unMute(); } catch (_) {} return; } // pre-caricamento
       if (!durationSent) { setTimeout(align, 4000); setTimeout(align, 12000); } // recupera il ritardo del primo buffering
       reportDuration();
-      try { player.setPlaybackQuality("highres"); } catch (_) {}
       var cur = 0; try { cur = player.getCurrentTime(); } catch (_) {}
       if (Math.abs(cur - target()) > DRIFT_MAX) { try { player.seekTo(target() + SEEK_LEAD, true); } catch (_) {} }
     } else if (e.data === YT.PlayerState.PAUSED && !ended) {
-      setTimeout(align, 250);                      // nessuno può mettere in pausa: riparte subito
+      setTimeout(align, 250);                          // nessuno può mettere in pausa: riparte subito
     } else if (e.data === YT.PlayerState.ENDED) {
       finish();
     }
@@ -96,7 +266,8 @@
 
   // Se l'autoplay con audio è bloccato, meglio partire muti che non partire.
   function checkAutoplay() {
-    if (ended || mutedFallbackTried || !playerReady || target() < 0) return;
+    if (ended || mutedFallbackTried || !playerReady) return;
+    if (target() < 0) { setTimeout(checkAutoplay, -target() * 1000 + 4000); return; }
     var s = state();
     if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) {
       mutedFallbackTried = true;
@@ -110,20 +281,24 @@
     if (player || !apiReady || !videoId) return;
     var vars = {
       autoplay: 0, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
-      modestbranding: 1, playsinline: 1, cc_load_policy: 0, vq: "hd1080"
+      modestbranding: 1, playsinline: 1, cc_load_policy: 0, cc_lang_pref: "none", hl: "it", vq: QUALITY
     };
     if (/^https?:$/.test(location.protocol)) vars.origin = location.origin;
     player = new YT.Player("player", {
-      width: "100%", height: "100%", videoId: videoId,
+      width: 1920, height: 1080, videoId: videoId,
       playerVars: vars,
       events: {
         onReady: function () {
           playerReady = true;
+          killCaptions();
           try { player.unMute(); player.setVolume(100); } catch (_) {}
-          try { player.setPlaybackQuality("highres"); } catch (_) {}
+          try { player.setPlaybackQuality(QUALITY); } catch (_) {}
+          // Prima del via: carica il video in silenzio così parte all'istante.
+          if (target() < 0) { try { player.mute(); player.playVideo(); } catch (_) {} }
           align();
-          setTimeout(checkAutoplay, Math.max(0, -target() * 1000) + 4000);
+          checkAutoplay();
         },
+        onApiChange: killCaptions,
         onStateChange: onStateChange,
         onError: function (e) { fail("errore YouTube " + (e && e.data)); }
       }
@@ -132,10 +307,12 @@
 
   function setup(id, start) {
     if (!/^[A-Za-z0-9_-]{11}$/.test(String(id)) || !isFinite(Number(start))) return;
+    var first = startedAtLocal == null;
     videoId = String(id);
     startedAtLocal = Number(start);
     createPlayer();
     align();
+    if (first) tick();
   }
 
   window.onYouTubeIframeAPIReady = function () { apiReady = true; createPlayer(); };
