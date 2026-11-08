@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- YouTube vuole sapere da quale sito arriva il player (errore 153 se manca): manda sempre l'origine. -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Evento video</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #player, #player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  /* Strato trasparente sopra il player: nessun click arriva a YouTube (niente pausa/controlli). */
+  #shield { position: absolute; inset: 0; z-index: 2; background: transparent; cursor: none; }
+  #wait { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center;
+          color: #d8c18a; font: 600 28px Georgia, "Times New Roman", serif; letter-spacing: .04em; background: #000; }
+  #wait.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<div id="shield"></div>
+<div id="wait">L'evento sta per iniziare…</div>
+<script>
+// Pagina del player di dejack-video. Va pubblicata su un indirizzo https (es. GitHub Pages):
+// da fw:// YouTube risponde "Error 153". Parametri nell'hash: #v=<videoId>&s=<inizio, ms orologio locale>.
+// La pagina condivide l'orologio del PC con lo script client, quindi si tiene in sync da sola;
+// se il ponte callEvent/Web.emit è disponibile lo usa per durata, fine e ricalibrazioni.
+(function () {
+  "use strict";
+  var DRIFT_MAX = 0.6;       // secondi di scarto tollerati prima di riallineare
+  var SEEK_LEAD = 0.4;       // un seek costa ~0,4-0,5 s di buffering: salta un filo avanti
+  var CHECK_EVERY = 60000;   // controllo sync ogni minuto
+  var API_TIMEOUT = 15000;
+
+  var player = null, apiReady = false, playerReady = false;
+  var videoId = null, startedAtLocal = null;
+  var startTimer = null, ended = false, durationSent = false, failed = false, mutedFallbackTried = false;
+  var waitEl = document.getElementById("wait");
+
+  function send(name, payload) {
+    try { if (typeof callEvent === "function") callEvent(name, payload == null ? null : JSON.stringify(payload)); } catch (_) {}
+  }
+  function fail(reason) {
+    if (failed || ended) return;
+    failed = true;
+    console.warn("[dejack-video] " + reason);
+    send("dv:failed", { reason: String(reason) });
+  }
+  function target() { return (Date.now() - startedAtLocal) / 1000; }
+  function duration() { try { return Number(player.getDuration()) || 0; } catch (_) { return 0; } }
+  function state() { try { return player.getPlayerState(); } catch (_) { return -1; } }
+
+  function reportDuration() {
+    var d = duration();
+    if (!durationSent && d > 0) { durationSent = true; send("dv:duration", { seconds: d }); }
+  }
+  function finish() {
+    if (ended) return;
+    ended = true;
+    try { player.stopVideo(); } catch (_) {}
+    send("dv:ended", null);
+  }
+
+  // Porta il player alla posizione giusta e lo fa suonare.
+  function align() {
+    if (!playerReady || ended || startedAtLocal == null) return;
+    var t = target();
+    if (t < 0) {                                   // non è ancora l'ora: aspetta il via comune
+      clearTimeout(startTimer);
+      startTimer = setTimeout(align, Math.min(-t * 1000, 60000));
+      return;
+    }
+    var d = duration();
+    if (d > 0 && t >= d - 0.5) return finish();     // entrato dopo la fine
+    var cur = 0;
+    try { cur = Number(player.getCurrentTime()) || 0; } catch (_) {}
+    var s = state();
+    if (Math.abs(cur - t) > DRIFT_MAX) { try { player.seekTo(t + SEEK_LEAD, true); } catch (_) {} }
+    if (s !==YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) { try { player.playVideo(); } catch (_) {} }
+    waitEl.classList.add("hidden");
+  }
+
+  function onStateChange(e) {
+    if (e.data === YT.PlayerState.PLAYING) {
+      if (!durationSent) { setTimeout(align, 4000); setTimeout(align, 12000); } // recupera il ritardo del primo buffering
+      reportDuration();
+      try { player.setPlaybackQuality("highres"); } catch (_) {}
+      var cur = 0; try { cur = player.getCurrentTime(); } catch (_) {}
+      if (Math.abs(cur - target()) > DRIFT_MAX) { try { player.seekTo(target() + SEEK_LEAD, true); } catch (_) {} }
+    } else if (e.data === YT.PlayerState.PAUSED && !ended) {
+      setTimeout(align, 250);                      // nessuno può mettere in pausa: riparte subito
+    } else if (e.data === YT.PlayerState.ENDED) {
+      finish();
+    }
+  }
+
+  // Se l'autoplay con audio è bloccato, meglio partire muti che non partire.
+  function checkAutoplay() {
+    if (ended || mutedFallbackTried || !playerReady || target() < 0) return;
+    var s = state();
+    if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) {
+      mutedFallbackTried = true;
+      console.warn("[dejack-video] autoplay con audio bloccato, riprovo muto");
+      try { player.mute(); } catch (_) {}
+      align();
+    }
+  }
+
+  function createPlayer() {
+    if (player || !apiReady || !videoId) return;
+    var vars = {
+      autoplay: 0, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
+      modestbranding: 1, playsinline: 1, cc_load_policy: 0, vq: "hd1080"
+    };
+    if (/^https?:$/.test(location.protocol)) vars.origin = location.origin;
+    player = new YT.Player("player", {
+      width: "100%", height: "100%", videoId: videoId,
+      playerVars: vars,
+      events: {
+        onReady: function () {
+          playerReady = true;
+          try { player.unMute(); player.setVolume(100); } catch (_) {}
+          try { player.setPlaybackQuality("highres"); } catch (_) {}
+          align();
+          setTimeout(checkAutoplay, Math.max(0, -target() * 1000) + 4000);
+        },
+        onStateChange: onStateChange,
+        onError: function (e) { fail("errore YouTube " + (e && e.data)); }
+      }
+    });
+  }
+
+  function setup(id, start) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(String(id)) || !isFinite(Number(start))) return;
+    videoId = String(id);
+    startedAtLocal = Number(start);
+    createPlayer();
+    align();
+  }
+
+  window.onYouTubeIframeAPIReady = function () { apiReady = true; createPlayer(); };
+
+  // Ponte opzionale con lo script client.
+  window.addEventListener("dv:play", function (e) { var d = e.detail || {}; setup(d.videoId, d.startedAtLocal); });
+  window.addEventListener("dv:sync", function (e) {
+    var d = e.detail || {};
+    if (isFinite(Number(d.startedAtLocal))) { startedAtLocal = Number(d.startedAtLocal); align(); }
+  });
+
+  // Avvio dai parametri nell'hash (funziona anche senza ponte).
+  var q = {};
+  location.hash.replace(/^#/, "").split("&").forEach(function (p) {
+    var i = p.indexOf("="); if (i > 0) q[decodeURIComponent(p.slice(0, i))] = decodeURIComponent(p.slice(i + 1));
+  });
+  if (q.v && q.s) setup(q.v, q.s);
+
+  setInterval(align, CHECK_EVERY);
+
+  var s = document.createElement("script");
+  s.src = "https://www.youtube.com/iframe_api";
+  s.onerror = function () { fail("iframe_api non caricabile"); };
+  document.head.appendChild(s);
+  setTimeout(function () { if (!playerReady) fail("timeout player"); }, API_TIMEOUT);
+
+  send("dv:ready", null);
+})();
+</script>
+</body>
+</html>
