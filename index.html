@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Il video MP4 è incluso nella risorsa e caricato localmente. -->
-
-<title>Video Taglia</title>
+<!-- YouTube vuole sapere da quale sito arriva il player (errore 153 se manca): manda sempre l'origine. -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Evento video</title>
 <style>
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
   /* Il player è sempre 1920x1080 "interni" e viene scalato allo schermo: YouTube sceglie la
@@ -13,7 +13,7 @@
   #stage { position: absolute; inset: 0; background: #000; opacity: 0; }
   #stage.on { opacity: 1; }
   #frame { position: absolute; left: 50%; top: 50%; width: 1920px; height: 1080px; transform-origin: 0 0; }
-  #frame video, #player { width: 1920px; height: 1080px; border: 0; display: block; object-fit: contain; background: #000; }
+  #frame iframe, #player { width: 1920px; height: 1080px; border: 0; display: block; }
   /* Strato trasparente sopra tutto: nessun click arriva a YouTube (niente pausa/controlli). */
   #shield { position: absolute; inset: 0; z-index: 5; background: transparent; cursor: none; }
 
@@ -33,12 +33,12 @@
 </style>
 </head>
 <body>
-<div id="stage"><div id="frame"><video id="player" playsinline preload="auto"></video></div></div>
+<div id="stage"><div id="frame"><div id="player"></div></div></div>
 <div id="black"></div>
 <div id="tv"><div id="crt"><canvas id="static" width="192" height="108"></canvas><div class="vig"></div><div class="white"></div></div><div id="glow"></div></div>
 <div id="shield"></div>
 <script>
-// Pagina locale del player MP4 di dejack-video-taglia.
+// Pagina del player di dejack-video. Pubblicata su https (GitHub Pages): da fw:// YouTube dà "Error 153".
 // Parametri nell'hash: #v=<videoId>&s=<inizio video, ms orologio locale>.
 // La pagina condivide l'orologio del PC con lo script client, quindi intro e video sono
 // sincronizzati da soli; il ponte callEvent/Web.emit (se c'è) serve per durata, fine, ricalibrazioni.
@@ -52,11 +52,13 @@
   var DRIFT_MAX = 0.6;       // secondi di scarto tollerati prima di riallineare
   var SEEK_LEAD = 0.4;       // un seek costa ~0,4-0,5 s di buffering: salta un filo avanti
   var CHECK_EVERY = 60000;   // controllo sync ogni minuto
+  var API_TIMEOUT = 15000;
+  var QUALITY = "hd1080";
 
-  var $ = function (id) { return document.getElementById(id); };
-  var player = $("player"), playerReady = true;
+  var player = null, apiReady = false, playerReady = false;
   var videoId = null, startedAtLocal = null;
   var startTimer = null, ended = false, durationSent = false, failed = false, mutedFallbackTried = false;
+  var $ = function (id) { return document.getElementById(id); };
   var stage = $("stage"), frame = $("frame"), black = $("black"), tv = $("tv");
   var crt = $("crt"), crtWhite = crt.querySelector(".white"), glow = $("glow"), stat = $("static");
   var sctx = stat.getContext("2d"), simg = sctx.createImageData(stat.width, stat.height);
@@ -67,12 +69,12 @@
   function fail(reason) {
     if (failed || ended) return;
     failed = true;
-    console.warn("[dejack-video-taglia] " + reason);
+    console.warn("[dejack-video] " + reason);
     send("dv:failed", { reason: String(reason) });
   }
   function target() { return (Date.now() - startedAtLocal) / 1000; }
-  function duration() { try { return Number(player.duration) || 0; } catch (_) { return 0; } }
-  function state() { return player && !player.paused && !player.ended ? 1 : 0; }
+  function duration() { try { return Number(player.getDuration()) || 0; } catch (_) { return 0; } }
+  function state() { try { return player.getPlayerState(); } catch (_) { return -1; } }
 
   // --- Scala 1920x1080 -> schermo (letterbox) -------------------------------------
   function fit() {
@@ -82,9 +84,11 @@
   addEventListener("resize", fit);
   fit();
 
-  // --- Sottotitoli: spenti sempre (non applicabile al video MP4) ------
+  // --- Sottotitoli: spenti sempre (YouTube carica da solo quelli automatici) ------
   function killCaptions() {
-    
+    try { player.setOption("captions", "track", {}); } catch (_) {}
+    try { player.unloadModule("captions"); } catch (_) {}
+    try { player.unloadModule("cc"); } catch (_) {}
   }
 
   // --- Intro: spegnimento TV come il video di riferimento (youtu.be/jntnUWWkZlA) --------
@@ -154,7 +158,7 @@
   function finish() {
     if (ended) return;
     ended = true;
-    try { player.pause(); } catch (_) {}
+    try { player.stopVideo(); } catch (_) {}
     send("dv:ended", null);
   }
 
@@ -170,43 +174,80 @@
     var d = duration();
     if (d > 0 && t >= d - 0.5) return finish();       // entrato dopo la fine
     var cur = 0;
-    try { cur = Number(player.currentTime) || 0; } catch (_) {}
+    try { cur = Number(player.getCurrentTime()) || 0; } catch (_) {}
     var s = state();
-    if (Math.abs(cur - t) > DRIFT_MAX) { try { player.currentTime = t > 1 ? t + SEEK_LEAD : t; } catch (_) {} }
-    if (!s) { try { var promise = player.play(); if (promise && promise.catch) promise.catch(function () {}); } catch (_) {} }
+    if (Math.abs(cur - t) > DRIFT_MAX) { try { player.seekTo(t > 1 ? t + SEEK_LEAD : t, true); } catch (_) {} }
+    if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) { try { player.playVideo(); } catch (_) {} }
   }
 
   function onStateChange(e) {
-    if (e.type === "playing") {
-      if (target() < 0) { try { player.pause(); player.currentTime = 0; } catch (_) {} return; } // attende l’istante sincronizzato
+    if (e.data === YT.PlayerState.PLAYING) {
+      killCaptions();
+      try { player.setPlaybackQuality(QUALITY); } catch (_) {}
+      if (target() < 0) { try { player.pauseVideo(); player.seekTo(0, true); player.unMute(); } catch (_) {} return; } // pre-caricamento
       if (!durationSent) { setTimeout(align, 4000); setTimeout(align, 12000); } // recupera il ritardo del primo buffering
       reportDuration();
-      var cur = 0; try { cur = player.currentTime; } catch (_) {}
-      if (Math.abs(cur - target()) > DRIFT_MAX) { try { player.currentTime = target() + SEEK_LEAD; } catch (_) {} }
-    } else if (e.type === "pause" && !ended) {
+      var cur = 0; try { cur = player.getCurrentTime(); } catch (_) {}
+      if (Math.abs(cur - target()) > DRIFT_MAX) { try { player.seekTo(target() + SEEK_LEAD, true); } catch (_) {} }
+    } else if (e.data === YT.PlayerState.PAUSED && !ended) {
       setTimeout(align, 250);                          // nessuno può mettere in pausa: riparte subito
-    } else if (e.type === "ended") {
+    } else if (e.data === YT.PlayerState.ENDED) {
       finish();
     }
   }
 
+  // Se l'autoplay con audio è bloccato, meglio partire muti che non partire.
+  function checkAutoplay() {
+    if (ended || mutedFallbackTried || !playerReady) return;
+    if (target() < 0) { setTimeout(checkAutoplay, -target() * 1000 + 4000); return; }
+    var s = state();
+    if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) {
+      mutedFallbackTried = true;
+      console.warn("[dejack-video] autoplay con audio bloccato, riprovo muto");
+      try { player.mute(); } catch (_) {}
+      align();
+    }
+  }
+
+  function createPlayer() {
+    if (player || !apiReady || !videoId) return;
+    var vars = {
+      autoplay: 0, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
+      modestbranding: 1, playsinline: 1, cc_load_policy: 0, cc_lang_pref: "none", hl: "it", vq: QUALITY
+    };
+    if (/^https?:$/.test(location.protocol)) vars.origin = location.origin;
+    player = new YT.Player("player", {
+      width: 1920, height: 1080, videoId: videoId,
+      playerVars: vars,
+      events: {
+        onReady: function () {
+          playerReady = true;
+          killCaptions();
+          try { player.unMute(); player.setVolume(100); } catch (_) {}
+          try { player.setPlaybackQuality(QUALITY); } catch (_) {}
+          // Prima del via: carica il video in silenzio così parte all'istante.
+          if (target() < 0) { try { player.mute(); player.playVideo(); } catch (_) {} }
+          align();
+          checkAutoplay();
+        },
+        onApiChange: killCaptions,
+        onStateChange: onStateChange,
+        onError: function (e) { fail("errore YouTube " + (e && e.data)); }
+      }
+    });
+  }
+
   function setup(id, start) {
-    if (String(id) !== "local-video" || !isFinite(Number(start))) return;
+    if (!/^[A-Za-z0-9_-]{11}$/.test(String(id)) || !isFinite(Number(start))) return;
     var first = startedAtLocal == null;
     videoId = String(id);
     startedAtLocal = Number(start);
-    if (first) {
-      player.src = new URL("Viadeow2.mp4", location.href).toString();
-      player.addEventListener("playing", onStateChange);
-      player.addEventListener("pause", onStateChange);
-      player.addEventListener("ended", onStateChange);
-      player.addEventListener("loadedmetadata", function () { reportDuration(); align(); });
-      player.addEventListener("error", function () { fail("file MP4 non caricabile"); });
-      player.load();
-    }
+    createPlayer();
     align();
     if (first) tick();
   }
+
+  window.onYouTubeIframeAPIReady = function () { apiReady = true; createPlayer(); };
 
   // Ponte opzionale con lo script client.
   window.addEventListener("dv:play", function (e) { var d = e.detail || {}; setup(d.videoId, d.startedAtLocal); });
@@ -226,6 +267,11 @@
 
   setInterval(align, CHECK_EVERY);
 
+  var s = document.createElement("script");
+  s.src = "https://www.youtube.com/iframe_api";
+  s.onerror = function () { fail("iframe_api non caricabile"); };
+  document.head.appendChild(s);
+  setTimeout(function () { if (!playerReady) fail("timeout player"); }, API_TIMEOUT);
 
   send("dv:ready", null);
 })();
