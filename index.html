@@ -267,6 +267,23 @@
 
   setInterval(align, CHECK_EVERY);
 
+  // Diagnostica qualità: per il primo minuto di video manda ogni 5 s cosa sta facendo YouTube
+  // (finisce nel log del server, così si capisce perché la qualità scende in gioco).
+  var statsSent = 0;
+  setInterval(function () {
+    if (!playerReady || ended || statsSent >= 12 || startedAtLocal == null || target() < 0) return;
+    statsSent++;
+    var st = { n: statsSent, t: Math.round(target()), q: "?", levels: [], state: state(),
+               w: innerWidth, h: innerHeight, dpr: devicePixelRatio, sw: screen.width, sh: screen.height, loaded: 0, muted: null };
+    try { st.q = player.getPlaybackQuality(); } catch (_) {}
+    try { st.levels = player.getAvailableQualityLevels(); } catch (_) {}
+    try { st.loaded = Math.round(player.getVideoLoadedFraction() * 100); } catch (_) {}
+    try { st.muted = player.isMuted(); } catch (_) {}
+    try { var f = frame.getBoundingClientRect(); st.box = Math.round(f.width) + "x" + Math.round(f.height); } catch (_) {}
+    console.log("[dejack-video] stats " + JSON.stringify(st));
+    send("dv:stats", st);
+  }, 5000);
+
   var s = document.createElement("script");
   s.src = "https://www.youtube.com/iframe_api";
   s.onerror = function () { fail("iframe_api non caricabile"); };
