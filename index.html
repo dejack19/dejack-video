@@ -84,6 +84,46 @@
   addEventListener("resize", fit);
   fit();
 
+  // --- Modalità file: un normale <video> con gli stessi comandi del player YouTube ----
+  // Usata quando nell'hash c'è f=<file>: il file sta accanto a questa pagina (GitHub Pages).
+  // Qualità = quella del file, sempre piena (YouTube nel gioco scende da solo a 240p).
+  var fileSrc = null;
+  var FILE_RE = /^[A-Za-z0-9_.-]{1,80}\.(webm|mp4)$/;
+  function FilePlayer(src, events) {
+    var v = document.createElement("video");
+    v.id = "player"; v.preload = "auto"; v.playsInline = true; v.controls = false; v.disablePictureInPicture = true;
+    v.setAttribute("playsinline", ""); v.style.cssText = "width:1920px;height:1080px;display:block;background:#000;object-fit:contain";
+    var old = $("player"); old.parentNode.replaceChild(v, old);
+    var st = -1, readyFired = false;
+    function set(s) { if (s === st) return; st = s; try { events.onStateChange({ data: s }); } catch (e) { console.warn(e); } }
+    v.addEventListener("playing", function () { set(1); });
+    v.addEventListener("pause", function () { if (!v.ended) set(2); });
+    v.addEventListener("waiting", function () { set(3); });
+    v.addEventListener("ended", function () { set(0); });
+    v.addEventListener("error", function () { events.onError({ data: "file " + (v.error ? v.error.code : "?") }); });
+    v.addEventListener("loadedmetadata", function () { if (!readyFired) { readyFired = true; events.onReady(); } });
+    v.src = src;
+    return {
+      getCurrentTime: function () { return v.currentTime || 0; },
+      seekTo: function (t) { try { v.currentTime = Math.max(0, Number(t) || 0); } catch (_) {} },
+      playVideo: function () {
+        try { var p = v.play(); if (p && p.catch) p.catch(function (e) { console.warn("[dejack-video] play: " + e); }); } catch (_) {}
+      },
+      pauseVideo: function () { v.pause(); },
+      stopVideo: function () { v.pause(); },
+      getDuration: function () { return isFinite(v.duration) ? v.duration : 0; },
+      getPlayerState: function () { return st; },
+      mute: function () { v.muted = true; }, unMute: function () { v.muted = false; }, isMuted: function () { return v.muted; },
+      setVolume: function (n) { v.volume = Math.max(0, Math.min(1, n / 100)); },
+      getPlaybackQuality: function () { return v.videoHeight ? v.videoHeight + "p" : "?"; },
+      getAvailableQualityLevels: function () { return ["file " + (v.videoWidth || "?") + "x" + (v.videoHeight || "?")]; },
+      getVideoLoadedFraction: function () {
+        try { return v.buffered.length && v.duration ? v.buffered.end(v.buffered.length - 1) / v.duration : 0; } catch (_) { return 0; }
+      },
+      setPlaybackQuality: function () {}, setOption: function () {}, unloadModule: function () {}
+    };
+  }
+
   // --- Sottotitoli: spenti sempre (YouTube carica da solo quelli automatici) ------
   function killCaptions() {
     try { player.setOption("captions", "track", {}); } catch (_) {}
@@ -210,7 +250,22 @@
   }
 
   function createPlayer() {
-    if (player || !apiReady || !videoId) return;
+    if (player) return;
+    if (fileSrc) {
+      player = FilePlayer(fileSrc, {
+        onReady: function () {
+          playerReady = true;
+          try { player.unMute(); player.setVolume(100); } catch (_) {}
+          if (target() < 0) { try { player.mute(); player.playVideo(); } catch (_) {} }
+          align();
+          checkAutoplay();
+        },
+        onStateChange: onStateChange,
+        onError: function (e) { fail("errore video " + (e && e.data)); }
+      });
+      return;
+    }
+    if (!apiReady || !videoId) return;
     var vars = {
       autoplay: 0, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
       modestbranding: 1, playsinline: 1, cc_load_policy: 0, cc_lang_pref: "none", hl: "it", vq: QUALITY
@@ -237,10 +292,13 @@
     });
   }
 
-  function setup(id, start) {
-    if (!/^[A-Za-z0-9_-]{11}$/.test(String(id)) || !isFinite(Number(start))) return;
+  function setup(id, start, file) {
+    if (!isFinite(Number(start))) return;
+    if (file != null && FILE_RE.test(String(file))) fileSrc = String(file);
+    else if (!/^[A-Za-z0-9_-]{11}$/.test(String(id))) return;
     var first = startedAtLocal == null;
-    videoId = String(id);
+    videoId = fileSrc ? null : String(id);
+    if (fileSrc) SEEK_LEAD = 0.05;                     // il seek su un file è quasi istantaneo
     startedAtLocal = Number(start);
     createPlayer();
     align();
@@ -250,7 +308,7 @@
   window.onYouTubeIframeAPIReady = function () { apiReady = true; createPlayer(); };
 
   // Ponte opzionale con lo script client.
-  window.addEventListener("dv:play", function (e) { var d = e.detail || {}; setup(d.videoId, d.startedAtLocal); });
+  window.addEventListener("dv:play", function (e) { var d = e.detail || {}; setup(d.videoId, d.startedAtLocal, d.file); });
   window.addEventListener("dv:sync", function (e) {
     var d = e.detail || {};
     if (isFinite(Number(d.startedAtLocal))) { startedAtLocal = Number(d.startedAtLocal); align(); }
@@ -263,7 +321,9 @@
   });
   function ms(v, def, max) { var n = Math.round(Number(v)); return isFinite(n) && n >= 0 && n <= max ? n : def; }
   DYING = ms(q.d, DYING, 20000); TV_OFF = ms(q.t, TV_OFF, 20000); BLACK = ms(q.b, BLACK, 20000);
-  if (q.v && q.s) setup(q.v, q.s);
+  // Modalità file: niente API YouTube, solo gli stati che il codice di sync usa.
+  if (q.f && FILE_RE.test(q.f) && !window.YT) window.YT = { PlayerState: { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 } };
+  if ((q.v || q.f) && q.s) setup(q.v, q.s, q.f);
 
   setInterval(align, CHECK_EVERY);
 
@@ -284,10 +344,12 @@
     send("dv:stats", st);
   }, 5000);
 
-  var s = document.createElement("script");
-  s.src = "https://www.youtube.com/iframe_api";
-  s.onerror = function () { fail("iframe_api non caricabile"); };
-  document.head.appendChild(s);
+  if (!fileSrc) {
+    var s = document.createElement("script");
+    s.src = "https://www.youtube.com/iframe_api";
+    s.onerror = function () { fail("iframe_api non caricabile"); };
+    document.head.appendChild(s);
+  }
   setTimeout(function () { if (!playerReady) fail("timeout player"); }, API_TIMEOUT);
 
   send("dv:ready", null);
